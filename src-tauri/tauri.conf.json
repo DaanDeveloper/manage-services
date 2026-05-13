@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Service Desk",
+  "version": "0.1.0",
+  "identifier": "com.servicedesk.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Service Desk",
+        "width": 560,
+        "height": 560,
+        "minWidth": 560,
+        "minHeight": 560,
+        "maxWidth": 560,
+        "maxHeight": 560,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "shadow": true,
+        "transparent": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": []
+  }
+}
