@@ -379,15 +379,90 @@ fn create_managed_service(
     port: u16,
     api_key: Option<String>,
 ) -> CommandResult<()> {
+    let data_dir = managed_service_dir(&app, &kind, port);
+
     if kind == "mysql" {
+        let mut mysqld = resolve_binary("mysqld");
+        if !std::path::Path::new(&mysqld).exists() {
+            if let Err(message) = ensure_mysql_installed() {
+                return CommandResult {
+                    ok: false,
+                    message,
+                    data: None,
+                };
+            }
+            mysqld = resolve_binary("mysqld");
+            if !std::path::Path::new(&mysqld).exists() {
+                return CommandResult {
+                    ok: false,
+                    message: "brew install mysql completed, but mysqld is still not in PATH."
+                        .to_string(),
+                    data: None,
+                };
+            }
+        }
+
+        if data_dir.exists() {
+            if let Err(error) = fs::remove_dir_all(&data_dir) {
+                return CommandResult {
+                    ok: false,
+                    message: format!("Could not reset managed mysql directory: {error}"),
+                    data: None,
+                };
+            }
+        }
+
+        if let Err(error) = fs::create_dir_all(&data_dir) {
+            return CommandResult {
+                ok: false,
+                message: format!("Could not create managed mysql directory: {error}"),
+                data: None,
+            };
+        }
+
+        let user = std::env::var("USER").unwrap_or_else(|_| "mysql".to_string());
+        let output = Command::new(&mysqld)
+            .args([
+                "--initialize-insecure".to_string(),
+                format!("--user={user}"),
+                format!("--datadir={}", data_dir.display()),
+            ])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return CommandResult {
+                    ok: false,
+                    message: format!("mysqld --initialize failed: {}", stderr.trim()),
+                    data: None,
+                };
+            }
+            Err(error) => {
+                return CommandResult {
+                    ok: false,
+                    message: format!("Could not run mysqld: {error}"),
+                    data: None,
+                };
+            }
+        }
+
+        let metadata = format!("kind=mysql\nport={port}\n");
+        if let Err(error) = fs::write(data_dir.join("service-desk.instance"), metadata) {
+            return CommandResult {
+                ok: false,
+                message: format!("Could not write managed mysql metadata: {error}"),
+                data: None,
+            };
+        }
+
         return CommandResult {
-            ok: false,
-            message: "Creating new managed MySQL instances is not implemented yet.".to_string(),
+            ok: true,
+            message: format!("Managed mysql instance prepared on port {port}."),
             data: None,
         };
     }
-
-    let data_dir = managed_service_dir(&app, &kind, port);
 
     if let Err(error) = fs::create_dir_all(&data_dir) {
         return CommandResult {
@@ -472,11 +547,7 @@ fn delete_managed_service(app: tauri::AppHandle, kind: String, port: u16) -> Com
             let _ = stop_typesense_instance(app.clone(), port);
         }
         "mysql" => {
-            return CommandResult {
-                ok: false,
-                message: "Deleting managed MySQL instances is not implemented yet.".to_string(),
-                data: None,
-            };
+            let _ = stop_mysql_instance(app.clone(), port, "managed mysql".to_string());
         }
         _ => {
             return CommandResult {
@@ -757,7 +828,65 @@ fn stop_process(pid: u32) -> CommandResult<()> {
 }
 
 #[tauri::command]
-fn start_mysql_instance(port: u16, name: String) -> CommandResult<()> {
+fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> CommandResult<()> {
+    let managed_dir = managed_service_dir(&app, "mysql", port);
+    if managed_dir.join("mysql").exists() {
+        if mysql_port_running(port) {
+            return CommandResult {
+                ok: true,
+                message: format!("{name} is already running on port {port}."),
+                data: None,
+            };
+        }
+
+        let mysqld = resolve_binary("mysqld");
+        if !std::path::Path::new(&mysqld).exists() {
+            return CommandResult {
+                ok: false,
+                message: "mysqld was not found in PATH.".to_string(),
+                data: None,
+            };
+        }
+
+        use std::os::unix::process::CommandExt;
+        let socket = managed_dir.join("mysql.sock");
+        let pid_file = managed_dir.join("mysqld.pid");
+        let err_log = managed_dir.join("error.log");
+        let mut cmd = Command::new(&mysqld);
+        cmd.args([
+            format!("--port={port}"),
+            format!("--datadir={}", managed_dir.display()),
+            format!("--socket={}", socket.display()),
+            format!("--pid-file={}", pid_file.display()),
+            format!("--log-error={}", err_log.display()),
+        ]);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        cmd.process_group(0);
+
+        match cmd.spawn() {
+            Ok(child) => {
+                drop(child);
+                return wait_for_mysql_state(port, true, &format!("{name} started."));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return CommandResult {
+                    ok: false,
+                    message: "mysqld was not found in PATH.".to_string(),
+                    data: None,
+                };
+            }
+            Err(error) => {
+                return CommandResult {
+                    ok: false,
+                    message: format!("Could not run mysqld: {error}"),
+                    data: None,
+                };
+            }
+        }
+    }
+
     if port == 3308 && std::path::Path::new("/Applications/XAMPP/xamppfiles/xampp").exists() {
         let result = run_xampp_admin_command("startmysql");
         return match command_status_result(result, format!("{name} start command sent."), "Could not start MySQL") {
@@ -780,7 +909,35 @@ fn start_mysql_instance(port: u16, name: String) -> CommandResult<()> {
 }
 
 #[tauri::command]
-fn stop_mysql_instance(port: u16, name: String) -> CommandResult<()> {
+fn stop_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> CommandResult<()> {
+    let managed_dir = managed_service_dir(&app, "mysql", port);
+    if managed_dir.join("mysql").exists() {
+        let socket = managed_dir.join("mysql.sock");
+        let pid_file = managed_dir.join("mysqld.pid");
+
+        let mysqladmin = resolve_binary("mysqladmin");
+        if std::path::Path::new(&mysqladmin).exists() && socket.exists() {
+            let _ = Command::new(&mysqladmin)
+                .args([
+                    "--socket".to_string(),
+                    socket.to_string_lossy().into_owned(),
+                    "shutdown".to_string(),
+                ])
+                .output();
+        }
+
+        if mysql_port_running(port) {
+            if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+                let trimmed = pid_str.trim();
+                if !trimmed.is_empty() {
+                    let _ = Command::new("/bin/kill").arg(trimmed).output();
+                }
+            }
+        }
+
+        return wait_for_mysql_state(port, false, &format!("{name} stopped."));
+    }
+
     if port == 3308 && std::path::Path::new("/Applications/XAMPP/xamppfiles/xampp").exists() {
         let result = run_xampp_admin_command("stopmysql");
         return match command_status_result(result, format!("{name} stop command sent."), "Could not stop MySQL") {
@@ -960,6 +1117,11 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 fn show_main_window_under_tray(
@@ -1320,6 +1482,41 @@ fn request_json(url: &str, api_key: &str) -> Result<Value, String> {
     serde_json::from_slice::<Value>(&output.stdout).map_err(|error| error.to_string())
 }
 
+fn resolve_brew() -> Option<String> {
+    for candidate in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] {
+        if std::path::Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn ensure_mysql_installed() -> Result<(), String> {
+    let Some(brew) = resolve_brew() else {
+        return Err(
+            "Homebrew is not installed. Install Homebrew first (https://brew.sh) or install MySQL manually."
+                .to_string(),
+        );
+    };
+
+    let output = Command::new(&brew)
+        .args(["install", "mysql"])
+        .output()
+        .map_err(|error| format!("Could not run brew install mysql: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{}\n{}", stderr.trim(), stdout.trim());
+    if combined.to_lowercase().contains("already installed") {
+        return Ok(());
+    }
+    Err(format!("brew install mysql failed: {}", combined.trim()))
+}
+
 fn resolve_binary(name: &str) -> String {
     let candidates = [
         format!("/Applications/XAMPP/xamppfiles/bin/{name}"),
@@ -1462,6 +1659,7 @@ pub fn run() {
             stop_process,
             check_typesense_health,
             list_typesense_collections,
+            quit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

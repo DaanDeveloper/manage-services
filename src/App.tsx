@@ -1,7 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, ChevronDown, ChevronRight, Plus, RefreshCw, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Plus,
+  Power,
+  RefreshCw,
+  Settings,
+  X,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { CommandResult } from "./types";
+
+type ThemeChoice = "system" | "light" | "dark";
+
+function getSystemTheme(): "light" | "dark" {
+  if (typeof window === "undefined" || !window.matchMedia) return "light";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
 
 type RedisInstance = {
   id: string;
@@ -18,6 +34,7 @@ type RedisInstance = {
 
 type Preferences = {
   launchOnLogin: boolean;
+  theme: ThemeChoice;
 };
 
 type DiscoveredService = {
@@ -133,11 +150,18 @@ function App() {
   const [preferences, setPreferences] = useState<Preferences>(() =>
     loadJson("service-desk.preferences", {
       launchOnLogin: false,
+      theme: "system" as ThemeChoice,
     }),
   );
+  const [showSettings, setShowSettings] = useState(false);
+  const settingsRef = useRef<HTMLDivElement>(null);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [newKind, setNewKind] = useState<"redis" | "typesense" | "mysql">("redis");
   const [addTypeOpen, setAddTypeOpen] = useState(false);
+  const addTypeRef = useRef<HTMLDivElement>(null);
+  const addRowRef = useRef<HTMLElement>(null);
+  const addButtonRef = useRef<HTMLButtonElement>(null);
   const [newName, setNewName] = useState("redis");
   const [newPort, setNewPort] = useState(6380);
   const [newApiKey, setNewApiKey] = useState("change-me");
@@ -153,6 +177,7 @@ function App() {
   );
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [confirmRemove, setConfirmRemove] = useState<RedisInstance | null>(null);
 
   useEffect(() => {
     localStorage.setItem("service-desk.redisInstances", JSON.stringify(instances));
@@ -167,9 +192,71 @@ function App() {
   }, [preferences]);
 
   useEffect(() => {
+    const root = document.documentElement;
+    const apply = () => {
+      const resolved =
+        preferences.theme === "system" ? getSystemTheme() : preferences.theme;
+      root.dataset.theme = resolved;
+      root.style.colorScheme = resolved;
+    };
+    apply();
+    if (preferences.theme !== "system") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [preferences.theme]);
+
+  useEffect(() => {
+    if (!addTypeOpen) return;
+    const handler = (event: MouseEvent) => {
+      if (addTypeRef.current?.contains(event.target as Node)) return;
+      setAddTypeOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [addTypeOpen]);
+
+  useEffect(() => {
+    if (!showAdd) return;
+    const handler = (event: MouseEvent) => {
+      if (addTypeOpen) return;
+      const target = event.target as Node;
+      if (addRowRef.current?.contains(target)) return;
+      if (addButtonRef.current?.contains(target)) return;
+      setShowAdd(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showAdd, addTypeOpen]);
+
+  useEffect(() => {
+    if (!showSettings) return;
+    const handler = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        settingsRef.current?.contains(target) ||
+        settingsButtonRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setShowSettings(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showSettings]);
+
+  useEffect(() => {
     void refreshAll();
     void unlockXamppAdmin();
   }, []);
+
+  async function quitApp() {
+    try {
+      await invoke("quit_app");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   function updateInstance(id: string, patch: Partial<RedisInstance>) {
     setInstances((current) =>
@@ -361,9 +448,14 @@ function App() {
       return;
     }
 
-    const managed = newKind !== "mysql";
+    const managed = true;
 
     if (managed) {
+      setMessage(
+        newKind === "mysql"
+          ? `Preparing ${newName.trim()}… (installs MySQL via Homebrew if missing — may take a few minutes)`
+          : `Preparing ${newName.trim()}…`,
+      );
       try {
         const result = await invoke<CommandResult>("create_managed_service", {
           kind: newKind,
@@ -390,7 +482,7 @@ function App() {
       version: newKind === "redis" ? "Redis" : newKind === "typesense" ? "Typesense" : "MySQL",
       apiKey: newKind === "typesense" ? newApiKey : undefined,
       managed,
-      socket: newKind === "mysql" ? newSocket || undefined : undefined,
+      socket: undefined,
       status: "stopped",
     };
 
@@ -482,22 +574,75 @@ function App() {
     <main className="desk">
       <section className="deskBody">
         <div className="topControls">
-          <button className="iconButton" type="button" title="Refresh" onClick={refreshAll}>
-            <RefreshCw size={16} />
-          </button>
-          <button className="iconButton" type="button" title="Add service" onClick={() => setShowAdd((value) => !value)}>
-            <Plus size={17} />
-          </button>
-          <label className="titleToggle">
-            <input
-              checked={preferences.launchOnLogin}
-              type="checkbox"
-              onChange={(event) =>
-                setPreferences((current) => ({ ...current, launchOnLogin: event.target.checked }))
-              }
-            />
-            <span>Launch on Login</span>
-          </label>
+          <div className="topControlsLeft">
+            <button className="iconButton" type="button" title="Refresh" onClick={refreshAll}>
+              <RefreshCw size={15} />
+            </button>
+            <button
+              ref={addButtonRef}
+              className={`iconButton${showAdd ? " active" : ""}`}
+              type="button"
+              title="Add service"
+              onClick={() => setShowAdd((value) => !value)}
+            >
+              <Plus size={16} />
+            </button>
+            <span className="topDivider" aria-hidden />
+            <label className="titleToggle">
+              <input
+                checked={preferences.launchOnLogin}
+                type="checkbox"
+                onChange={(event) =>
+                  setPreferences((current) => ({ ...current, launchOnLogin: event.target.checked }))
+                }
+              />
+              <span className="toggleBox" aria-hidden>
+                <Check size={11} strokeWidth={3} />
+              </span>
+              <span className="toggleLabel">Launch on Login</span>
+            </label>
+          </div>
+          <div className="topControlsRight">
+            <div className="settingsWrapper">
+              <button
+                ref={settingsButtonRef}
+                className={`iconButton${showSettings ? " active" : ""}`}
+                type="button"
+                title="Settings"
+                onClick={() => setShowSettings((value) => !value)}
+              >
+                <Settings size={15} />
+              </button>
+              {showSettings && (
+                <div ref={settingsRef} className="settingsPanel" role="dialog" aria-label="Settings">
+                  <div className="settingsSection">
+                    <div className="settingsLabel">Appearance</div>
+                    <div className="segmented" role="radiogroup" aria-label="Theme">
+                      {(["system", "light", "dark"] as const).map((option) => (
+                        <button
+                          key={option}
+                          type="button"
+                          role="radio"
+                          aria-checked={preferences.theme === option}
+                          className={preferences.theme === option ? "active" : ""}
+                          onClick={() =>
+                            setPreferences((current) => ({ ...current, theme: option }))
+                          }
+                        >
+                          {option === "system" ? "Auto" : option === "light" ? "Light" : "Dark"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="settingsDivider" />
+                  <button className="settingsQuit" type="button" onClick={quitApp}>
+                    <Power size={13} />
+                    <span>Quit Service Desk</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
 
         <nav className="tabBar" aria-label="Sections">
@@ -506,47 +651,64 @@ function App() {
         </nav>
 
         {showAdd && (
-          <section className="addRow">
-            <div className="customSelect">
-              <button type="button" onClick={() => setAddTypeOpen((value) => !value)}>
-                <span>{newKind === "redis" ? "Redis" : newKind === "typesense" ? "Typesense" : "MySQL"}</span>
-                <ChevronDown size={14} />
-              </button>
-              {addTypeOpen && (
-                <div className="customSelectMenu">
-                  <button type="button" onClick={() => selectAddKind("redis")}>Redis</button>
-                  <button type="button" onClick={() => selectAddKind("typesense")}>Typesense</button>
-                  <button type="button" onClick={() => selectAddKind("mysql")}>MySQL</button>
-                </div>
-              )}
+          <section ref={addRowRef} className="addRow">
+            <div className="addField">
+              <label className="addLabel">Type</label>
+              <div ref={addTypeRef} className="customSelect">
+                <button type="button" onClick={() => setAddTypeOpen((value) => !value)}>
+                  <span>{newKind === "redis" ? "Redis" : newKind === "typesense" ? "Typesense" : "MySQL"}</span>
+                  <ChevronDown size={14} />
+                </button>
+                {addTypeOpen && (
+                  <div className="customSelectMenu">
+                    <button type="button" onClick={() => selectAddKind("redis")}>Redis</button>
+                    <button type="button" onClick={() => selectAddKind("typesense")}>Typesense</button>
+                    <button type="button" onClick={() => selectAddKind("mysql")}>MySQL</button>
+                  </div>
+                )}
+              </div>
             </div>
-            <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="Name" />
-            <input
-              value={newPort}
-              min={1}
-              max={65535}
-              type="number"
-              onChange={(event) => setNewPort(Number(event.target.value))}
-              placeholder="Port"
-            />
-            {newKind === "typesense" && (
-              <input value={newApiKey} onChange={(event) => setNewApiKey(event.target.value)} placeholder="API key" />
-            )}
-            {newKind === "mysql" && (
+            <div className="addField">
+              <label className="addLabel" htmlFor="add-name">Name</label>
               <input
-                value={newSocket}
-                onBlur={() => inferMysqlPort(newSocket)}
-                onChange={(event) => setNewSocket(event.target.value)}
-                placeholder="Socket"
+                id="add-name"
+                value={newName}
+                onChange={(event) => setNewName(event.target.value)}
+                placeholder="my-service"
               />
+            </div>
+            <div className="addField">
+              <label className="addLabel" htmlFor="add-port">Port</label>
+              <input
+                id="add-port"
+                value={newPort}
+                min={1}
+                max={65535}
+                type="number"
+                onChange={(event) => setNewPort(Number(event.target.value))}
+                placeholder="6379"
+              />
+            </div>
+            {newKind === "typesense" && (
+              <div className="addField">
+                <label className="addLabel" htmlFor="add-apikey">API key</label>
+                <input
+                  id="add-apikey"
+                  value={newApiKey}
+                  onChange={(event) => setNewApiKey(event.target.value)}
+                  placeholder="change-me"
+                />
+              </div>
             )}
-            <button className="smallAction primary" type="button" onClick={addService}>
-              <Check size={14} />
-              Add
-            </button>
-            <button className="iconButton" type="button" title="Cancel" onClick={() => setShowAdd(false)}>
-              <X size={15} />
-            </button>
+            <div className="addActions">
+              <button className="smallAction" type="button" onClick={() => setShowAdd(false)}>
+                Cancel
+              </button>
+              <button className="smallAction primary" type="button" onClick={addService}>
+                <Check size={14} />
+                Add service
+              </button>
+            </div>
           </section>
         )}
 
@@ -605,7 +767,7 @@ function App() {
                   >
                     {instance.status === "running" ? "Stop" : instance.status === "checking" ? "..." : "Start"}
                   </button>
-                  <button className="removeButton" type="button" title="Remove" onClick={() => removeService(instance.id)}>
+                  <button className="removeButton" type="button" title="Remove" onClick={() => setConfirmRemove(instance)}>
                     <X size={14} />
                   </button>
                 </div>
@@ -698,7 +860,7 @@ function App() {
                   >
                     {instance.status === "running" ? "Stop" : instance.status === "checking" ? "..." : "Start"}
                   </button>
-                  <button className="removeButton" type="button" title="Remove" onClick={() => removeService(instance.id)}>
+                  <button className="removeButton" type="button" title="Remove" onClick={() => setConfirmRemove(instance)}>
                     <X size={14} />
                   </button>
                 </div>
@@ -709,6 +871,47 @@ function App() {
 
         <footer className="statusbar">{message}</footer>
       </section>
+
+      {confirmRemove && (
+        <div className="modalOverlay" onMouseDown={() => setConfirmRemove(null)}>
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <h3 id="confirm-title" className="modalTitle">
+              Remove {confirmRemove.name}?
+            </h3>
+            <p className="modalBody">
+              {confirmRemove.managed
+                ? "This will stop the service and permanently delete its data directory."
+                : "This will remove the service from the list. The underlying service itself stays untouched."}
+            </p>
+            <div className="modalActions">
+              <button
+                className="smallAction"
+                type="button"
+                onClick={() => setConfirmRemove(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="smallAction danger"
+                type="button"
+                onClick={async () => {
+                  const target = confirmRemove;
+                  setConfirmRemove(null);
+                  await removeService(target.id);
+                }}
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
