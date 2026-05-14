@@ -9,6 +9,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{ActivationPolicy, Manager, PhysicalPosition, Rect};
 use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize)]
 struct CommandResult<T>
@@ -372,6 +373,40 @@ fn managed_service_dir(app: &tauri::AppHandle, kind: &str, port: u16) -> std::pa
         .join(format!("{kind}-{port}"))
 }
 
+fn mysql_basedir(mysqld: &str) -> Option<PathBuf> {
+    let path = Path::new(mysqld);
+    let parent = path.parent()?;
+
+    if parent.file_name().and_then(|name| name.to_str()) == Some("sbin") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+
+    parent.parent().map(Path::to_path_buf)
+}
+
+fn mysql_install_db_for_mysqld(mysqld: &str) -> Option<String> {
+    let basedir = mysql_basedir(mysqld)?;
+    [
+        basedir.join("bin/mariadb-install-db"),
+        basedir.join("bin/mysql_install_db"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn mysqld_supports_initialize(mysqld: &str) -> bool {
+    Command::new(mysqld)
+        .args(["--no-defaults", "--verbose", "--help"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            stdout.contains("--initialize") || stderr.contains("--initialize")
+        })
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 fn create_managed_service(
     app: tauri::AppHandle,
@@ -420,22 +455,44 @@ fn create_managed_service(
             };
         }
 
-        let user = std::env::var("USER").unwrap_or_else(|_| "mysql".to_string());
-        let output = Command::new(&mysqld)
-            .args([
-                "--initialize-insecure".to_string(),
-                format!("--user={user}"),
+        let output = if mysqld_supports_initialize(&mysqld) {
+            Command::new(&mysqld)
+                .args([
+                    "--no-defaults".to_string(),
+                    "--initialize-insecure".to_string(),
+                    format!("--datadir={}", data_dir.display()),
+                ])
+                .output()
+        } else if let Some(install_db) = mysql_install_db_for_mysqld(&mysqld) {
+            let basedir = mysql_basedir(&mysqld);
+            let mut command = Command::new(&install_db);
+            command.args([
+                "--no-defaults".to_string(),
                 format!("--datadir={}", data_dir.display()),
-            ])
-            .output();
+                "--auth-root-authentication-method=normal".to_string(),
+                "--skip-test-db".to_string(),
+            ]);
+            if let Some(basedir) = basedir {
+                command.arg(format!("--basedir={}", basedir.display()));
+            }
+            command.output()
+        } else {
+            return CommandResult {
+                ok: false,
+                message: format!("{mysqld} does not support --initialize-insecure and no mysql_install_db script was found."),
+                data: None,
+            };
+        };
 
         match output {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = format!("{}\n{}", stderr.trim(), stdout.trim());
                 return CommandResult {
                     ok: false,
-                    message: format!("mysqld --initialize failed: {}", stderr.trim()),
+                    message: format!("mysql initialization failed: {}", detail.trim()),
                     data: None,
                 };
             }
@@ -853,6 +910,10 @@ fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> Comma
         let pid_file = managed_dir.join("mysqld.pid");
         let err_log = managed_dir.join("error.log");
         let mut cmd = Command::new(&mysqld);
+        cmd.arg("--no-defaults");
+        if let Some(basedir) = mysql_basedir(&mysqld) {
+            cmd.arg(format!("--basedir={}", basedir.display()));
+        }
         cmd.args([
             format!("--port={port}"),
             format!("--datadir={}", managed_dir.display()),

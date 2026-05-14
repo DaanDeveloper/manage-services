@@ -865,4 +865,7 @@ button:focus-visible {
   word-break: break-word;
   max-height: 30vh;
   overflow-y: auto;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
 }
