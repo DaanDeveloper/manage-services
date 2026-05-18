@@ -1139,7 +1139,7 @@ fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String, config: 
         match cmd.spawn() {
             Ok(child) => {
                 drop(child);
-                return wait_for_mysql_state(port, true, &format!("{name} started."));
+                return wait_for_mysql_start(port, &format!("{name} started."), &err_log);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return CommandResult {
@@ -1177,6 +1177,50 @@ fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String, config: 
         CommandResult { ok: true, .. } => wait_for_mysql_state(port, true, &format!("{name} started.")),
         error => error,
     }
+}
+
+fn wait_for_mysql_start(port: u16, success_message: &str, error_log: &std::path::Path) -> CommandResult<()> {
+    let mut consecutive_running = 0;
+
+    for _ in 0..80 {
+        if mysql_port_running(port) {
+            consecutive_running += 1;
+            if consecutive_running >= 8 {
+                return CommandResult {
+                    ok: true,
+                    message: success_message.to_string(),
+                    data: None,
+                };
+            }
+        } else {
+            consecutive_running = 0;
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let log_tail = tail_file(error_log, 12);
+    let detail = if log_tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLast MySQL log lines:\n{}", log_tail.trim())
+    };
+
+    CommandResult {
+        ok: false,
+        message: format!("MySQL command was sent, but port {port} did not stay running.{detail}"),
+        data: None,
+    }
+}
+
+fn tail_file(path: &std::path::Path, max_lines: usize) -> String {
+    let Ok(content) = fs::read_to_string(path) else {
+        return String::new();
+    };
+
+    let mut lines = content.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
 }
 
 #[tauri::command]
@@ -1231,13 +1275,30 @@ fn stop_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> Comman
 }
 
 fn wait_for_mysql_state(port: u16, expected_running: bool, success_message: &str) -> CommandResult<()> {
+    let mut consecutive_running = 0;
+
     for _ in 0..60 {
-        if mysql_port_running(port) == expected_running {
+        let running = mysql_port_running(port);
+
+        if !expected_running && !running {
             return CommandResult {
                 ok: true,
                 message: success_message.to_string(),
                 data: None,
             };
+        }
+
+        if expected_running && running {
+            consecutive_running += 1;
+            if consecutive_running >= 6 {
+                return CommandResult {
+                    ok: true,
+                    message: success_message.to_string(),
+                    data: None,
+                };
+            }
+        } else {
+            consecutive_running = 0;
         }
 
         std::thread::sleep(Duration::from_millis(250));
