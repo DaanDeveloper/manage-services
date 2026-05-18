@@ -1925,10 +1925,10 @@ pub fn run() {
         })
         .setup(|app| {
             let _ = app.set_activation_policy(ActivationPolicy::Accessory);
-            let icon = app
-                .default_window_icon()
-                .expect("default window icon is required for tray")
-                .clone();
+            let icon = tauri::image::Image::from_bytes(include_bytes!(
+                "../icons/service-manager-logo-white-transparent-40x40.png"
+            ))
+            .expect("tray icon must be a valid PNG");
 
             let tray = TrayIconBuilder::with_id("main-tray")
                 .tooltip("Service Desk")
