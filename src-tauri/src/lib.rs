@@ -633,6 +633,200 @@ fn delete_managed_service(app: tauri::AppHandle, kind: String, port: u16) -> Com
 }
 
 #[tauri::command]
+fn read_mysql_config(app: tauri::AppHandle, port: u16, socket: Option<String>, managed: bool) -> CommandResult<String> {
+    let mut candidates = Vec::new();
+
+    if managed {
+        return read_mysql_config_file(managed_service_dir(&app, "mysql", port).join("my.cnf"));
+    }
+
+    candidates.extend(mysql_config_candidates(socket.as_deref()));
+
+    for path in candidates {
+        let result = read_mysql_config_file(path);
+        if result.ok {
+            return result;
+        }
+    }
+
+    CommandResult {
+        ok: false,
+        message: "No MySQL config file was found.".to_string(),
+        data: None,
+    }
+}
+
+fn mysql_config_candidates(socket: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(socket) = socket.filter(|value| !value.trim().is_empty()) {
+        if let Some(prefix) = socket.strip_suffix("/var/mysql/mysql.sock") {
+            candidates.push(std::path::PathBuf::from(prefix).join("etc/my.cnf"));
+        }
+    }
+
+    candidates.extend([
+        std::path::PathBuf::from("/Applications/XAMPP/xamppfiles/etc/my.cnf"),
+        std::path::PathBuf::from("/opt/homebrew/etc/my.cnf"),
+        std::path::PathBuf::from("/usr/local/etc/my.cnf"),
+        std::path::PathBuf::from("/etc/my.cnf"),
+    ]);
+
+    candidates
+}
+
+fn read_mysql_config_file(path: std::path::PathBuf) -> CommandResult<String> {
+    if !path.exists() {
+        return CommandResult {
+            ok: false,
+            message: format!("MySQL config was not found at {}.", path.display()),
+            data: None,
+        };
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(content) => CommandResult {
+            ok: true,
+            message: format!("Loaded MySQL config from {}.", path.display()),
+            data: Some(content),
+        },
+        Err(error) => CommandResult {
+            ok: false,
+            message: format!("Could not read MySQL config from {}: {error}", path.display()),
+            data: None,
+        },
+    }
+}
+
+#[tauri::command]
+fn open_mysql_config(
+    app: tauri::AppHandle,
+    port: u16,
+    socket: Option<String>,
+    managed: bool,
+    config: Option<String>,
+) -> CommandResult<String> {
+    let path = if managed {
+        let path = managed_service_dir(&app, "mysql", port).join("my.cnf");
+        if !path.exists() {
+            let content = config
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("[mysqld]\nport={port}\nskip-networking=0\n"));
+            if let Err(error) = fs::write(&path, content) {
+                return CommandResult {
+                    ok: false,
+                    message: format!("Could not create MySQL config at {}: {error}", path.display()),
+                    data: None,
+                };
+            }
+        }
+        path
+    } else {
+        let Some(path) = mysql_config_candidates(socket.as_deref()).into_iter().find(|path| path.exists()) else {
+            return CommandResult {
+                ok: false,
+                message: "No MySQL config file was found.".to_string(),
+                data: None,
+            };
+        };
+        path
+    };
+
+    let config_result = read_mysql_config_file(path.clone());
+    if !config_result.ok {
+        return config_result;
+    }
+
+    let output = Command::new("/usr/bin/open")
+        .arg("-t")
+        .arg(&path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => CommandResult {
+            ok: true,
+            message: format!("Opened MySQL config at {}.", path.display()),
+            data: config_result.data,
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            CommandResult {
+                ok: false,
+                message: format!("Could not open MySQL config: {}", stderr.trim()),
+                data: config_result.data,
+            }
+        }
+        Err(error) => CommandResult {
+            ok: false,
+            message: format!("Could not open MySQL config: {error}"),
+            data: config_result.data,
+        },
+    }
+}
+
+#[tauri::command]
+fn move_managed_mysql_instance(app: tauri::AppHandle, old_port: u16, new_port: u16) -> CommandResult<()> {
+    if old_port == new_port {
+        return CommandResult {
+            ok: true,
+            message: format!("Managed mysql remains on port {new_port}."),
+            data: None,
+        };
+    }
+
+    if mysql_port_running(old_port) {
+        return CommandResult {
+            ok: false,
+            message: format!("Stop MySQL on port {old_port} before changing its port."),
+            data: None,
+        };
+    }
+
+    let old_dir = managed_service_dir(&app, "mysql", old_port);
+    let new_dir = managed_service_dir(&app, "mysql", new_port);
+
+    if !old_dir.exists() {
+        return CommandResult {
+            ok: false,
+            message: format!("Managed mysql data directory for port {old_port} was not found."),
+            data: None,
+        };
+    }
+
+    if new_dir.exists() {
+        return CommandResult {
+            ok: false,
+            message: format!("Managed mysql data directory for port {new_port} already exists."),
+            data: None,
+        };
+    }
+
+    if let Err(error) = fs::rename(&old_dir, &new_dir) {
+        return CommandResult {
+            ok: false,
+            message: format!("Could not move managed mysql directory: {error}"),
+            data: None,
+        };
+    }
+
+    let metadata = format!("kind=mysql\nport={new_port}\n");
+    if let Err(error) = fs::write(new_dir.join("service-desk.instance"), metadata) {
+        let _ = fs::rename(&new_dir, &old_dir);
+        return CommandResult {
+            ok: false,
+            message: format!("Could not update managed mysql metadata: {error}"),
+            data: None,
+        };
+    }
+
+    CommandResult {
+        ok: true,
+        message: format!("Managed mysql moved from port {old_port} to {new_port}."),
+        data: None,
+    }
+}
+
+#[tauri::command]
 fn test_typesense_connection(
     host: String,
     port: u16,
@@ -885,7 +1079,7 @@ fn stop_process(pid: u32) -> CommandResult<()> {
 }
 
 #[tauri::command]
-fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> CommandResult<()> {
+fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String, config: Option<String>) -> CommandResult<()> {
     let managed_dir = managed_service_dir(&app, "mysql", port);
     if managed_dir.join("mysql").exists() {
         if mysql_port_running(port) {
@@ -909,8 +1103,24 @@ fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> Comma
         let socket = managed_dir.join("mysql.sock");
         let pid_file = managed_dir.join("mysqld.pid");
         let err_log = managed_dir.join("error.log");
+        let config_file = managed_dir.join("my.cnf");
+
+        if let Some(config) = config.filter(|value| !value.trim().is_empty()) {
+            if let Err(error) = fs::write(&config_file, config) {
+                return CommandResult {
+                    ok: false,
+                    message: format!("Could not write MySQL config: {error}"),
+                    data: None,
+                };
+            }
+        }
+
         let mut cmd = Command::new(&mysqld);
-        cmd.arg("--no-defaults");
+        if config_file.exists() {
+            cmd.arg(format!("--defaults-file={}", config_file.display()));
+        } else {
+            cmd.arg("--no-defaults");
+        }
         if let Some(basedir) = mysql_basedir(&mysqld) {
             cmd.arg(format!("--basedir={}", basedir.display()));
         }
@@ -929,7 +1139,7 @@ fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> Comma
         match cmd.spawn() {
             Ok(child) => {
                 drop(child);
-                return wait_for_mysql_state(port, true, &format!("{name} started."));
+                return wait_for_mysql_start(port, &format!("{name} started."), &err_log);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return CommandResult {
@@ -967,6 +1177,50 @@ fn start_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> Comma
         CommandResult { ok: true, .. } => wait_for_mysql_state(port, true, &format!("{name} started.")),
         error => error,
     }
+}
+
+fn wait_for_mysql_start(port: u16, success_message: &str, error_log: &std::path::Path) -> CommandResult<()> {
+    let mut consecutive_running = 0;
+
+    for _ in 0..80 {
+        if mysql_port_running(port) {
+            consecutive_running += 1;
+            if consecutive_running >= 8 {
+                return CommandResult {
+                    ok: true,
+                    message: success_message.to_string(),
+                    data: None,
+                };
+            }
+        } else {
+            consecutive_running = 0;
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let log_tail = tail_file(error_log, 12);
+    let detail = if log_tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLast MySQL log lines:\n{}", log_tail.trim())
+    };
+
+    CommandResult {
+        ok: false,
+        message: format!("MySQL command was sent, but port {port} did not stay running.{detail}"),
+        data: None,
+    }
+}
+
+fn tail_file(path: &std::path::Path, max_lines: usize) -> String {
+    let Ok(content) = fs::read_to_string(path) else {
+        return String::new();
+    };
+
+    let mut lines = content.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
 }
 
 #[tauri::command]
@@ -1021,13 +1275,30 @@ fn stop_mysql_instance(app: tauri::AppHandle, port: u16, name: String) -> Comman
 }
 
 fn wait_for_mysql_state(port: u16, expected_running: bool, success_message: &str) -> CommandResult<()> {
+    let mut consecutive_running = 0;
+
     for _ in 0..60 {
-        if mysql_port_running(port) == expected_running {
+        let running = mysql_port_running(port);
+
+        if !expected_running && !running {
             return CommandResult {
                 ok: true,
                 message: success_message.to_string(),
                 data: None,
             };
+        }
+
+        if expected_running && running {
+            consecutive_running += 1;
+            if consecutive_running >= 6 {
+                return CommandResult {
+                    ok: true,
+                    message: success_message.to_string(),
+                    data: None,
+                };
+            }
+        } else {
+            consecutive_running = 0;
         }
 
         std::thread::sleep(Duration::from_millis(250));
@@ -1709,6 +1980,9 @@ pub fn run() {
             start_redis_instance,
             stop_redis_instance,
             delete_managed_service,
+            read_mysql_config,
+            open_mysql_config,
+            move_managed_mysql_instance,
             test_typesense_connection,
             start_typesense_instance,
             stop_typesense_instance,

@@ -28,6 +28,7 @@ type RedisInstance = {
   version: string;
   apiKey?: string;
   socket?: string;
+  mysqlConfig?: string;
   managed?: boolean;
   status: "running" | "stopped" | "checking";
 };
@@ -133,6 +134,7 @@ function normalizeInstances(instances: RedisInstance[]): RedisInstance[] {
       ...instance,
       kind,
       apiKey: kind === "typesense" ? instance.apiKey ?? "change-me" : undefined,
+      mysqlConfig: kind === "mysql" ? instance.mysqlConfig : undefined,
       managed: Boolean(instance.managed),
       socket,
     };
@@ -141,6 +143,83 @@ function normalizeInstances(instances: RedisInstance[]): RedisInstance[] {
 
 function serviceKey(kind: RedisInstance["kind"], port: number) {
   return `${kind}:${port}`;
+}
+
+function cleanMysqlConfigValue(value: string) {
+  return value
+    .replace(/\s[#;].*$/, "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+}
+
+function defaultMysqlConfig(port: number, socket?: string) {
+  return [
+    "[mysqld]",
+    `port=${port}`,
+    socket ? `socket=${socket}` : "",
+    "skip-networking=0",
+    "",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+function readMysqlConfigValue(config: string, key: string) {
+  let inMysqld = false;
+  const normalizedKey = key.toLowerCase();
+
+  for (const line of config.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+
+    const section = trimmed.match(/^\[([^\]]+)\]$/);
+    if (section) {
+      inMysqld = section[1].toLowerCase() === "mysqld";
+      continue;
+    }
+
+    if (!inMysqld) continue;
+
+    const [rawKey, ...valueParts] = trimmed.split("=");
+    if (rawKey.trim().toLowerCase().replace(/-/g, "_") !== normalizedKey) continue;
+
+    return cleanMysqlConfigValue(valueParts.join("="));
+  }
+
+  return undefined;
+}
+
+function upsertMysqlConfigValue(config: string, key: string, value: string) {
+  const lines = config.split(/\r?\n/);
+  let inMysqld = false;
+  let mysqldIndex = -1;
+  const normalizedKey = key.toLowerCase();
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    const section = trimmed.match(/^\[([^\]]+)\]$/);
+
+    if (section) {
+      inMysqld = section[1].toLowerCase() === "mysqld";
+      if (inMysqld) mysqldIndex = index;
+      continue;
+    }
+
+    if (!inMysqld || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+
+    const [rawKey] = trimmed.split("=");
+    if (rawKey.trim().toLowerCase().replace(/-/g, "_") === normalizedKey) {
+      lines[index] = `${key}=${value}`;
+      return lines.join("\n");
+    }
+  }
+
+  if (mysqldIndex >= 0) {
+    lines.splice(mysqldIndex + 1, 0, `${key}=${value}`);
+    return lines.join("\n");
+  }
+
+  return [`[mysqld]`, `${key}=${value}`, config].filter(Boolean).join("\n");
 }
 
 function App() {
@@ -177,6 +256,11 @@ function App() {
   );
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [configuring, setConfiguring] = useState<RedisInstance | null>(null);
+  const [configName, setConfigName] = useState("");
+  const [configPort, setConfigPort] = useState("");
+  const [configSocket, setConfigSocket] = useState("");
+  const [configText, setConfigText] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<RedisInstance | null>(null);
 
   useEffect(() => {
@@ -392,6 +476,7 @@ function App() {
             : await invoke<CommandResult>("start_mysql_instance", {
                 port: instance.port,
                 name: instance.name,
+                config: instance.mysqlConfig,
               });
 
       setMessage(result.message);
@@ -481,6 +566,7 @@ function App() {
       port,
       version: newKind === "redis" ? "Redis" : newKind === "typesense" ? "Typesense" : "MySQL",
       apiKey: newKind === "typesense" ? newApiKey : undefined,
+      mysqlConfig: newKind === "mysql" ? defaultMysqlConfig(port) : undefined,
       managed,
       socket: undefined,
       status: "stopped",
@@ -548,6 +634,144 @@ function App() {
   function cancelRename() {
     setEditingId(null);
     setEditingName("");
+  }
+
+  async function beginConfigure(instance: RedisInstance) {
+    const fallbackConfig = instance.mysqlConfig ?? defaultMysqlConfig(instance.port, instance.socket);
+    setConfiguring(instance);
+    setConfigName(instance.name);
+    setConfigPort(String(instance.port));
+    setConfigSocket(instance.socket ?? "");
+    setConfigText(fallbackConfig);
+
+    try {
+      const result = await invoke<CommandResult<string>>("read_mysql_config", {
+        port: instance.port,
+        socket: instance.socket,
+        managed: Boolean(instance.managed),
+      });
+
+      if (!result.ok || !result.data) {
+        setMessage(result.message);
+        return;
+      }
+
+      applyMysqlConfigContent(result.data);
+      setMessage(result.message);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function cancelConfigure() {
+    setConfiguring(null);
+    setConfigName("");
+    setConfigPort("");
+    setConfigSocket("");
+    setConfigText("");
+  }
+
+  function updateConfigPort(value: string) {
+    setConfigPort(value);
+    if (/^\d+$/.test(value)) {
+      setConfigText((current) => upsertMysqlConfigValue(current, "port", value));
+    }
+  }
+
+  function updateConfigSocket(value: string) {
+    setConfigSocket(value);
+    setConfigText((current) =>
+      value.trim() ? upsertMysqlConfigValue(current, "socket", value.trim()) : current,
+    );
+  }
+
+  function applyMysqlConfigContent(content: string) {
+    const loadedPort = readMysqlConfigValue(content, "port");
+    const loadedSocket = readMysqlConfigValue(content, "socket");
+
+    setConfigText(content);
+    if (loadedPort) setConfigPort(loadedPort);
+    if (loadedSocket) setConfigSocket(loadedSocket);
+  }
+
+  async function openMysqlConfigDocument() {
+    if (!configuring) {
+      return;
+    }
+
+    try {
+      const result = await invoke<CommandResult<string>>("open_mysql_config", {
+        port: configuring.port,
+        socket: configuring.socket,
+        managed: Boolean(configuring.managed),
+        config: configText,
+      });
+
+      if (result.data) {
+        applyMysqlConfigContent(result.data);
+      }
+      setMessage(result.message);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function saveMysqlConfig() {
+    if (!configuring) {
+      return;
+    }
+
+    const name = configName.trim();
+    const configPortValue = readMysqlConfigValue(configText, "port");
+    const configSocketValue = readMysqlConfigValue(configText, "socket");
+    const port = Number(configPortValue ?? configPort);
+    const socket = (configSocketValue ?? configSocket).trim();
+
+    if (!name || !Number.isInteger(port) || port < 1 || port > 65535) {
+      setMessage("Use a name and a valid MySQL port.");
+      return;
+    }
+
+    if (instances.some((instance) => instance.id !== configuring.id && instance.port === port)) {
+      setMessage(`Port ${port} is already in the list.`);
+      return;
+    }
+
+    if (port !== configuring.port && configuring.status !== "stopped") {
+      setMessage("Stop MySQL before changing its port.");
+      return;
+    }
+
+    if (configuring.managed && port !== configuring.port) {
+      try {
+        const result = await invoke<CommandResult>("move_managed_mysql_instance", {
+          oldPort: configuring.port,
+          newPort: port,
+        });
+
+        if (!result.ok) {
+          setMessage(result.message);
+          return;
+        }
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
+
+    const oldKey = serviceKey(configuring.kind, configuring.port);
+    const newKey = serviceKey(configuring.kind, port);
+
+    setHiddenServices((current) => current.filter((entry) => entry !== oldKey && entry !== newKey));
+    updateInstance(configuring.id, {
+      name,
+      port,
+      socket: socket || undefined,
+      mysqlConfig: upsertMysqlConfigValue(configText.trim(), "port", String(port)),
+      status: "stopped",
+    });
+    cancelConfigure();
+    setMessage(port === configuring.port ? "MySQL config updated" : `MySQL config updated; app port is now ${port}.`);
   }
 
   async function stopProcess(process: ProcessInfo) {
@@ -767,6 +991,16 @@ function App() {
                   >
                     {instance.status === "running" ? "Stop" : instance.status === "checking" ? "..." : "Start"}
                   </button>
+                  {instance.kind === "mysql" && (
+                    <button
+                      className="configButton"
+                      type="button"
+                      title="Configure MySQL"
+                      onClick={() => void beginConfigure(instance)}
+                    >
+                      <Settings size={14} />
+                    </button>
+                  )}
                   <button className="removeButton" type="button" title="Remove" onClick={() => setConfirmRemove(instance)}>
                     <X size={14} />
                   </button>
@@ -871,6 +1105,64 @@ function App() {
 
         <footer className="statusbar">{message}</footer>
       </section>
+
+      {configuring && (
+        <div className="modalOverlay" onMouseDown={cancelConfigure}>
+          <div
+            className="modal configModal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="config-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <h3 id="config-title" className="modalTitle">
+              Configure {configuring.name}
+            </h3>
+            <div className="configFields">
+              <label className="configField" htmlFor="mysql-config-name">
+                <span>Name</span>
+                <input
+                  id="mysql-config-name"
+                  value={configName}
+                  onChange={(event) => setConfigName(event.target.value)}
+                />
+              </label>
+              <label className="configField" htmlFor="mysql-config-port">
+                <span>Port</span>
+                <input
+                  id="mysql-config-port"
+                  value={configPort}
+                  min={1}
+                  max={65535}
+                  type="number"
+                  disabled={configuring.status !== "stopped"}
+                  onChange={(event) => updateConfigPort(event.target.value)}
+                />
+              </label>
+              <label className="configField" htmlFor="mysql-config-socket">
+                <span>Socket</span>
+                <input
+                  id="mysql-config-socket"
+                  value={configSocket}
+                  onChange={(event) => updateConfigSocket(event.target.value)}
+                  placeholder="/tmp/mysql.sock"
+                />
+              </label>
+            </div>
+            <button className="smallAction configOpenAction" type="button" onClick={openMysqlConfigDocument}>
+              Open my.cnf
+            </button>
+            <div className="modalActions">
+              <button className="smallAction" type="button" onClick={cancelConfigure}>
+                Cancel
+              </button>
+              <button className="smallAction primary" type="button" onClick={saveMysqlConfig}>
+                Save config
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {confirmRemove && (
         <div className="modalOverlay" onMouseDown={() => setConfirmRemove(null)}>
