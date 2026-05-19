@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Check,
   ChevronDown,
@@ -262,6 +263,7 @@ function App() {
   const [configSocket, setConfigSocket] = useState("");
   const [configText, setConfigText] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<RedisInstance | null>(null);
+  const lastActivationRefreshRef = useRef(0);
 
   useEffect(() => {
     localStorage.setItem("service-desk.redisInstances", JSON.stringify(instances));
@@ -334,6 +336,50 @@ function App() {
     void unlockXamppAdmin();
   }, []);
 
+  useEffect(() => {
+    let unlistenActivation: (() => void) | undefined;
+    let disposed = false;
+
+    const refreshIfCurrent = () => {
+      const now = Date.now();
+      if (now - lastActivationRefreshRef.current < 1000) {
+        return;
+      }
+
+      lastActivationRefreshRef.current = now;
+      void refreshAll(instances, hiddenServices);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshIfCurrent();
+      }
+    };
+
+    const handleFocus = () => {
+      refreshIfCurrent();
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    void listen("service-desk:activated", refreshIfCurrent).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+
+      unlistenActivation = unlisten;
+    });
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      unlistenActivation?.();
+    };
+  }, [instances, hiddenServices]);
+
   async function quitApp() {
     try {
       await invoke("quit_app");
@@ -377,14 +423,17 @@ function App() {
     }
   }
 
-  async function syncDiscoveredServices(currentInstances = instances) {
+  async function syncDiscoveredServices(
+    currentInstances = instances,
+    currentHiddenServices = hiddenServices,
+  ) {
     try {
       const discovered = await invoke<DiscoveredService[]>("discover_running_services");
       const known = new Map(currentInstances.map((instance) => [`${instance.kind}:${instance.port}`, instance]));
 
       for (const service of discovered) {
         const key = `${service.kind}:${service.port}`;
-        if (hiddenServices.includes(key)) {
+        if (currentHiddenServices.includes(key)) {
           continue;
         }
         const existing = known.get(key);
@@ -411,9 +460,12 @@ function App() {
     }
   }
 
-  async function refreshAll() {
+  async function refreshAll(
+    currentInstances = instances,
+    currentHiddenServices = hiddenServices,
+  ) {
     setMessage("Checking services...");
-    const merged = await syncDiscoveredServices();
+    const merged = await syncDiscoveredServices(currentInstances, currentHiddenServices);
     await refreshProcesses();
     await Promise.all(merged.map((instance) => refreshInstance(instance)));
     setMessage("Status updated");
@@ -799,7 +851,7 @@ function App() {
       <section className="deskBody">
         <div className="topControls">
           <div className="topControlsLeft">
-            <button className="iconButton" type="button" title="Refresh" onClick={refreshAll}>
+            <button className="iconButton" type="button" title="Refresh" onClick={() => void refreshAll()}>
               <RefreshCw size={15} />
             </button>
             <button

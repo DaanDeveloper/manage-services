@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{ActivationPolicy, Manager, PhysicalPosition, Rect};
+use tauri::{ActivationPolicy, Emitter, Manager, PhysicalPosition, Rect};
 use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 
@@ -1448,6 +1448,7 @@ fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+        let _ = app.emit("service-desk:activated", ());
     }
 }
 
@@ -1475,6 +1476,7 @@ fn show_main_window_under_tray(
 
         let _ = window.show();
         let _ = window.set_focus();
+        let _ = app.emit("service-desk:activated", ());
     }
 }
 
