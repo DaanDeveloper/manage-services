@@ -333,7 +333,7 @@ function App() {
 
   useEffect(() => {
     void refreshAll();
-    void unlockXamppAdmin();
+    void syncLaunchOnLogin();
   }, []);
 
   useEffect(() => {
@@ -500,11 +500,32 @@ function App() {
     }
   }
 
-  async function unlockXamppAdmin() {
+  async function syncLaunchOnLogin() {
     try {
-      await invoke<CommandResult>("unlock_xampp_admin");
-    } catch {
-      // XAMPP admin unlock is best-effort; direct Start/Stop still falls back to macOS auth.
+      const result = await invoke<CommandResult<boolean>>("get_launch_on_login");
+      if (result.ok && typeof result.data === "boolean") {
+        setPreferences((current) => ({ ...current, launchOnLogin: result.data ?? false }));
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function setLaunchOnLogin(enabled: boolean) {
+    const previous = preferences.launchOnLogin;
+    setPreferences((current) => ({ ...current, launchOnLogin: enabled }));
+
+    try {
+      const result = await invoke<CommandResult<boolean>>("set_launch_on_login", { enabled });
+      if (!result.ok) {
+        setPreferences((current) => ({ ...current, launchOnLogin: previous }));
+      } else if (typeof result.data === "boolean") {
+        setPreferences((current) => ({ ...current, launchOnLogin: result.data ?? enabled }));
+      }
+      setMessage(result.message);
+    } catch (error) {
+      setPreferences((current) => ({ ...current, launchOnLogin: previous }));
+      setMessage(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -869,7 +890,7 @@ function App() {
                 checked={preferences.launchOnLogin}
                 type="checkbox"
                 onChange={(event) =>
-                  setPreferences((current) => ({ ...current, launchOnLogin: event.target.checked }))
+                  void setLaunchOnLogin(event.target.checked)
                 }
               />
               <span className="toggleBox" aria-hidden>

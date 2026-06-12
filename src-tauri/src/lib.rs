@@ -8,6 +8,8 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{ActivationPolicy, Emitter, Manager, PhysicalPosition, Rect};
+#[cfg(desktop)]
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 
@@ -1457,6 +1459,78 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+#[tauri::command]
+fn get_launch_on_login(app: tauri::AppHandle) -> CommandResult<bool> {
+    #[cfg(desktop)]
+    {
+        return match app.autolaunch().is_enabled() {
+            Ok(enabled) => CommandResult {
+                ok: true,
+                message: if enabled {
+                    "Launch on Login is enabled.".to_string()
+                } else {
+                    "Launch on Login is disabled.".to_string()
+                },
+                data: Some(enabled),
+            },
+            Err(error) => CommandResult {
+                ok: false,
+                message: format!("Could not read Launch on Login: {error}"),
+                data: None,
+            },
+        };
+    }
+
+    #[cfg(not(desktop))]
+    {
+        CommandResult {
+            ok: false,
+            message: "Launch on Login is only available on desktop.".to_string(),
+            data: Some(false),
+        }
+    }
+}
+
+#[tauri::command]
+fn set_launch_on_login(app: tauri::AppHandle, enabled: bool) -> CommandResult<bool> {
+    #[cfg(desktop)]
+    {
+        let manager = app.autolaunch();
+        let result = if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
+
+        return match result {
+            Ok(()) => CommandResult {
+                ok: true,
+                message: if enabled {
+                    "Launch on Login enabled.".to_string()
+                } else {
+                    "Launch on Login disabled.".to_string()
+                },
+                data: Some(enabled),
+            },
+            Err(error) => CommandResult {
+                ok: false,
+                message: format!("Could not update Launch on Login: {error}"),
+                data: None,
+            },
+        };
+    }
+
+    #[cfg(not(desktop))]
+    {
+        let _ = enabled;
+        CommandResult {
+            ok: false,
+            message: "Launch on Login is only available on desktop.".to_string(),
+            data: Some(false),
+        }
+    }
+}
+
 fn show_main_window_under_tray(
     app: &tauri::AppHandle,
     tray_rect: Rect,
@@ -1917,6 +1991,13 @@ fn resolve_dbngin_binary(name: &str) -> Option<String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(Vec::<&str>::new()),
+        ))
         .manage(AppState::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(false) = event {
@@ -1997,6 +2078,8 @@ pub fn run() {
             check_typesense_health,
             list_typesense_collections,
             quit_app,
+            get_launch_on_login,
+            set_launch_on_login,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
